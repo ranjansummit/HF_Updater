@@ -47,7 +47,6 @@ def fetch_all_pages_for_date(date_str: str) -> pd.DataFrame:
     """
     all_rows = []
     page = 1
-    date_str = "2026-10-30"
     while True:
         url = f"{BASE_URL}?date={date_str}&page={page}&page_size={PAGE_SIZE}"
         print(f"[info] Fetching: {url}")
