@@ -2,7 +2,7 @@
 
 Never reads/overwrites the historical NEPSE_ALL_MERGED.parquet. Normalizes into
 its 9-column V2 schema, validates a complete paginated fetch, and uploads only
-one root-level daily file after explicit confirmation.
+one root-level daily file after confirmation (automatic in GitHub Actions).
 
 Usage:
     python nepse_daily_v2.py
@@ -198,12 +198,18 @@ def page_results(payload: object, page: int) -> tuple[list, int | None]:
 
 
 def fetch_page(session, day, page, retries=5):
+    """Return (rows, reported_total), or None when the page responds HTTP 404.
+
+    A 404 is NOT a success by itself. collect_day only accepts it as the end
+    after earlier valid pages, repeated confirmation and completeness checks.
+    Other HTTP errors (including 429/5xx) remain fatal after retrying.
+    """
     params = {"date": day, "page": page, "page_size": PAGE_SIZE}
     for attempt in range(1, retries + 1):
         try:
             response = session.get(BASE_URL, params=params, timeout=(10, 45))
-            if response.status_code in (429, 500, 502, 503, 504):
-                raise requests.HTTPError(f"HTTP {response.status_code}")
+            if response.status_code == 404:
+                return None
             response.raise_for_status()
             try:
                 return page_results(response.json(), page)
@@ -211,7 +217,9 @@ def fetch_page(session, day, page, retries=5):
                 raise RuntimeError(f"Bad API response on page {page}: {exc}") from exc
         except (requests.RequestException, RuntimeError) as exc:
             if attempt == retries:
-                raise RuntimeError(f"Page {page} failed after {retries} attempts; refusing upload: {exc}") from exc
+                raise RuntimeError(
+                    f"Page {page} failed after {retries} attempts; refusing upload: {exc}"
+                ) from exc
             wait = min(2 ** (attempt - 1), 16)
             print(f"  [retry] page={page} attempt={attempt}/{retries}: {exc}; backoff={wait}s", flush=True)
             time.sleep(wait)
@@ -230,7 +238,7 @@ def collect_day(day: str, expected_count: int | None) -> tuple[Path | None, dict
         "raw_api_rows": 0, "unique_rows": 0, "duplicate_rows": 0,
         "repaired_values": 0, "api_reported_total": None,
         "expected_count": expected_count, "timestamp_rows": 0,
-        "status": "IN_PROGRESS",
+        "status": "IN_PROGRESS", "end_reason": None,
     }
     session = requests.Session()
     session.headers.update({"User-Agent": "NEPSE-daily-parquet-v2/1.0", "Accept": "application/json"})
@@ -241,7 +249,41 @@ def collect_day(day: str, expected_count: int | None) -> tuple[Path | None, dict
     last_fingerprint = None
     try:
         while page <= 5000:
-            rows, total = fetch_page(session, day, page)
+            result = fetch_page(session, day, page)
+            if result is None:
+                # Some APIs return HTTP 404 instead of an empty list when the
+                # requested page is beyond the last available page.
+                if stats["pages_nonempty"] == 0:
+                    fail(f"page {page}: HTTP 404 before any data; NOT treating as completed day")
+                time.sleep(1.0)
+                if fetch_page(session, day, page) is not None:
+                    fail(f"page {page}: transient HTTP 404; pagination is unstable")
+
+                declared_total = stats["api_reported_total"]
+                if declared_total is not None and stats["raw_api_rows"] != declared_total:
+                    fail(f"page {page}: HTTP 404 with only {stats['raw_api_rows']} of "
+                         f"{declared_total} API-reported rows; refusing incomplete upload")
+
+                if declared_total is None:
+                    # With no total in the API response, check there is no
+                    # reachable next page (a hole in pagination).
+                    next_result = fetch_page(session, day, page + 1)
+                    if next_result is not None:
+                        next_rows, next_total = next_result
+                        if next_rows:
+                            fail(f"page {page}: HTTP 404 but page {page+1} has rows; refusing incomplete upload")
+                        if next_total is not None and next_total != stats["raw_api_rows"]:
+                            fail(f"page {page+1}: API total {next_total} disagrees with "
+                                 f"{stats['raw_api_rows']} collected rows")
+                    print("[note] API did not provide a total: end-of-pages confirmed, "
+                          "but an independent count is still recommended")
+
+                stats["end_reason"] = "HTTP_404_CONFIRMED"
+                print(f"[done] page={page} returned HTTP 404 twice after "
+                      f"{stats['pages_nonempty']} valid pages; pagination ended", flush=True)
+                break
+
+            rows, total = result
             if total is not None:
                 if total < 0:
                     fail(f"page {page}: invalid negative total {total}")
@@ -250,16 +292,23 @@ def collect_day(day: str, expected_count: int | None) -> tuple[Path | None, dict
                 stats["api_reported_total"] = total
             if len(rows) > PAGE_SIZE:
                 fail(f"page {page}: returned {len(rows)} rows, more than page_size={PAGE_SIZE}")
+            if (stats["api_reported_total"] is not None
+                    and stats["raw_api_rows"] + len(rows) > stats["api_reported_total"]):
+                fail(f"page {page}: API returned more rows than its stated total")
             if not rows:
                 # A single transient empty response is not always the true end.
                 time.sleep(1.0)
-                confirm_rows, confirm_total = fetch_page(session, day, page)
+                confirmation = fetch_page(session, day, page)
+                if confirmation is None:
+                    fail(f"page {page}: empty response became HTTP 404 on retry; pagination is unstable")
+                confirm_rows, confirm_total = confirmation
                 if confirm_rows:
                     fail(f"page {page}: an empty page became non-empty on retry; pagination is unstable")
                 if confirm_total is not None and stats["api_reported_total"] not in (None, confirm_total):
                     fail(f"page {page}: inconsistent API total on empty-page confirmation")
                 if confirm_total is not None and stats["api_reported_total"] is None:
                     stats["api_reported_total"] = confirm_total
+                stats["end_reason"] = "EMPTY_PAGE_CONFIRMED"
                 print(f"[done] page={page} empty twice; pagination ended normally")
                 break
             fingerprint = (len(rows), json.dumps(rows[0], sort_keys=True, default=str),
@@ -288,6 +337,12 @@ def collect_day(day: str, expected_count: int | None) -> tuple[Path | None, dict
                 if note["repair"]:
                     stats["repaired_values"] += 1
             print(f"[page {page}] {len(rows)} rows; cumulative {stats['raw_api_rows']}; unique {len(seen)}", flush=True)
+            if (stats["api_reported_total"] is not None
+                    and stats["raw_api_rows"] == stats["api_reported_total"]):
+                stats["end_reason"] = "API_TOTAL_REACHED"
+                print(f"[done] Collected all {stats['raw_api_rows']} API-reported rows "
+                      "without requesting an out-of-range page", flush=True)
+                break
             page += 1
             time.sleep(0.25)
         else:
@@ -384,7 +439,12 @@ def main(argv=None):
             report["status"] = "REMOTE_ALREADY_EXISTS_NO_UPLOAD"
             save_report(args.date, report)
             return 0
-        if not args.yes:
+        # GitHub Actions cannot provide interactive input. Running in CI is
+        # an explicit automation context, so auto-confirm upload there.
+        auto_confirm = args.yes or os.getenv("GITHUB_ACTIONS", "").lower() == "true"
+        if auto_confirm:
+            print("[upload] Automatic confirmation: GitHub Actions or --yes")
+        else:
             prompt = f"Upload ONE file '{remote}' to {repo} as a new commit? [y/N]: "
             if input(prompt).strip().lower() != "y":
                 print("[no upload] Local validated Parquet kept.")
