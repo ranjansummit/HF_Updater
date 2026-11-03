@@ -1,17 +1,1 @@
 
-name: Schedule Test
-
-on:
-  workflow_dispatch:
-  schedule:
-    - cron: '*/5 * * * *'
-
-jobs:
-  test:
-    runs-on: ubuntu-latest
-    steps:
-      - name: Check automatic trigger
-        run: |
-          echo "Event: ${{ github.event_name }}"
-          date -u
-          TZ=Asia/Kathmandu date
