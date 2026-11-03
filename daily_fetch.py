@@ -40,8 +40,8 @@ BASE_DIR = Path(__file__).resolve().parent
 OUT_DIR = BASE_DIR / "parquet_out"
 REPORT_DIR = BASE_DIR / "reports"
 SCHEMA = pa.schema([
-    pa.field("business_date", pa.string()),
     pa.field("contract_id", pa.string()),
+    pa.field("business_date", pa.string()),
     pa.field("symbol", pa.string()),
     pa.field("buyer", pa.string()),
     pa.field("seller", pa.string()),
@@ -140,8 +140,8 @@ def normalize(raw: dict, expected_day: str) -> tuple[dict, dict]:
         fail(f"unrecoverable zero: contract_id={contract_id}, qty={quantity}, rate={rate}, amount={amount}")
     traded_at = parse_timestamp(raw, expected_day)
     return {
-        "business_date": business_date,
         "contract_id": contract_id,
+        "business_date": business_date,
         "symbol": symbol,
         "buyer": buyer,
         "seller": seller,
