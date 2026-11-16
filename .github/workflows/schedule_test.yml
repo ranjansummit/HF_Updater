@@ -1,4 +1,4 @@
-name: Test Kaggle secret access
+name: Run Kaggle notebook
 
 on:
   workflow_dispatch:
@@ -7,7 +7,7 @@ permissions:
   contents: read
 
 jobs:
-  test:
+  run-kaggle:
     runs-on: ubuntu-24.04
     timeout-minutes: 20
 
@@ -15,7 +15,7 @@ jobs:
       KAGGLE_USERNAME: ${{ secrets.KAGGLE_USERNAME }}
       KAGGLE_KEY: ${{ secrets.KAGGLE_KEY }}
 
-      # Change this to the exact slug from your Kaggle notebook URL.
+      # Change to the exact slug from your notebook URL.
       NOTEBOOK_SLUG: kaggletest
 
     steps:
@@ -26,38 +26,39 @@ jobs:
         run: |
           echo "NOTEBOOK=${KAGGLE_USERNAME}/${NOTEBOOK_SLUG}" >> "$GITHUB_ENV"
 
-      - name: Download sample notebook and metadata
+      - name: Download notebook code and metadata
         run: |
-          mkdir -p sample
-          kaggle kernels pull "$NOTEBOOK" -p sample -m
+          mkdir -p notebook
+          kaggle kernels pull "$NOTEBOOK" -p notebook -m
 
-      - name: Start sample on Kaggle
-        run: kaggle kernels push -p sample
+      - name: Start notebook on Kaggle
+        run: kaggle kernels push -p notebook
 
-      - name: Wait for result
+      - name: Wait for Kaggle result
         shell: bash
         run: |
           for attempt in $(seq 1 35); do
+            sleep 30
+
             status="$(kaggle kernels status "$NOTEBOOK")"
             printf '%s\n' "$status"
 
             case "${status,,}" in
               *complete*)
-                echo "PASS: API-triggered sample completed."
+                echo "SUCCESS: Kaggle notebook completed."
                 exit 0
                 ;;
               *error*|*failed*|*cancel*)
-                echo "FAIL: Kaggle run did not complete successfully."
+                echo "FAIL: Kaggle notebook failed. See execution logs."
                 exit 1
                 ;;
             esac
-
-            sleep 30
           done
 
-          echo "Timed out waiting. Check the sample notebook on Kaggle."
+          echo "TIMEOUT: Kaggle did not finish within the waiting period."
           exit 1
 
-      - name: Show sample execution logs
-        if: always()
+      - name: Show Kaggle execution logs
+        if: always() && env.NOTEBOOK != ''
+        continue-on-error: true
         run: kaggle kernels logs "$NOTEBOOK"
