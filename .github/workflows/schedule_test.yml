@@ -16,7 +16,7 @@ jobs:
       KAGGLE_KEY: ${{ secrets.KAGGLE_KEY }}
 
       # Change this to the exact slug from your Kaggle notebook URL.
-      NOTEBOOK_SLUG: sample_kaggle_github
+      NOTEBOOK_SLUG: kaggletest
 
     steps:
       - name: Install Kaggle CLI
