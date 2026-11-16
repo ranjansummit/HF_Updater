@@ -1,1 +1,63 @@
 
+name: Test Kaggle secret access
+
+on:
+  workflow_dispatch:
+    inputs:
+      notebook:
+        description: "Sample notebook: username/notebook-slug"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    env:
+      KAGGLE_USERNAME: ${{ secrets.KAGGLE_USERNAME }}
+      KAGGLE_KEY: ${{ secrets.KAGGLE_KEY }}
+      NOTEBOOK: ${{ inputs.notebook }}
+
+    steps:
+      - name: Install Kaggle CLI
+        run: python -m pip install --upgrade kaggle
+
+      - name: Download sample notebook and metadata
+        run: |
+          mkdir -p sample
+          kaggle kernels pull "$NOTEBOOK" -p sample -m
+
+      - name: Start sample on Kaggle
+        run: kaggle kernels push -p sample
+
+      - name: Wait for result
+        shell: bash
+        run: |
+          for attempt in $(seq 1 35); do
+            status="$(kaggle kernels status "$NOTEBOOK")"
+            printf '%s\n' "$status"
+
+            case "${status,,}" in
+              *complete*)
+                echo "PASS: API-triggered sample completed."
+                exit 0
+                ;;
+              *error*|*failed*|*cancel*)
+                echo "FAIL: Kaggle run did not complete successfully."
+                exit 1
+                ;;
+            esac
+
+            sleep 30
+          done
+
+          echo "Timed out waiting. Check the sample notebook on Kaggle."
+          exit 1
+
+      - name: Show sample execution logs
+        if: always()
+        run: kaggle kernels logs "$NOTEBOOK"
