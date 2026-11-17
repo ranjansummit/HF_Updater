@@ -9,7 +9,11 @@ Repair an aggregate: python nepse_daily_v2.py --date YYYY-MM-DD --aggregate-only
 Environment: HF_TOKEN; optional HF_REPO_ID, HF_AGG_REPO_ID, HF_INDEX_REPO_ID.
 Requires: pandas>=2.2,<3 numpy<3 pyarrow>=15 requests huggingface_hub>=0.27,<2
 Uses the original non-broker feature formulas; S below must match seed training settings.
-No training, broker features, historical master download, or historical backfill.
+Model: ranjansummit/nepse-p33-models/combined_production_YYYY-MM-DD.joblib
+Filename date is the last usable training date, not the execution date.
+Train only: python nepse_daily_v2.py --train-only --yes
+Also requires scikit-learn==1.6.1 joblib; optional HF_MODEL_REPO_ID.
+No broker features, historical master download, or historical backfill.
 """
 from __future__ import annotations
 
@@ -738,7 +742,7 @@ def publish_aggregate(api, floorsheet_repo, day):
         merged, unchanged = merge_aggregate(existing, row)
         if unchanged and metadata:
             print(f'[AGGREGATE SUCCESS] {day} unchanged; no extra commit; {time.monotonic()-started:.1f}s', flush=True)
-            return {'status':'UNCHANGED','date':day,'repo':AGG_REPO,'rows':len(merged)}
+            return {'status':'UNCHANGED','date':day,'repo':AGG_REPO,'rows':len(merged),'revision':revision}
         metadata['aggregation'] = identity
         metadata.setdefault('daily_sources', {})[day] = {
             'floorsheets_repo':floorsheet_repo, 'floorsheets_revision':floor_revision,
@@ -766,8 +770,439 @@ def publish_aggregate(api, floorsheet_repo, day):
         url = str(getattr(commit, 'commit_url', ''))
         print(f'[AGGREGATE SUCCESS] {day}: {row["input_method"]}, class={row["cls"]}, '
               f'{len(merged)} dates; {time.monotonic()-started:.1f}s; {url}', flush=True)
-        return {'status':'UPLOADED','date':day,'repo':AGG_REPO,'rows':len(merged),'commit_url':url}
+        return {'status':'UPLOADED','date':day,'repo':AGG_REPO,'rows':len(merged),'commit_url':url,'revision':getattr(commit,'oid',None)}
     fail('Aggregate commit could not be completed')
+
+
+# Training uses exactly the original non-broker Logistic Regression + Ridge pipeline.
+import hashlib
+import platform
+import joblib
+import sklearn
+from sklearn.pipeline import make_pipeline
+from sklearn.impute import SimpleImputer
+from sklearn.preprocessing import StandardScaler
+from sklearn.linear_model import LogisticRegression, Ridge
+from sklearn.metrics import (accuracy_score, f1_score, log_loss, confusion_matrix,
+                             mean_absolute_error, mean_squared_error)
+MODEL_REPO = os.getenv("HF_MODEL_REPO_ID", "ranjansummit/nepse-p33-models")
+FEATURES = FEATS_TX + FEATS_PX
+CLASSES = ["bear", "deer", "bull"]
+SPLIT_SEED = 42
+OUT = OUT_DIR / "trained_model"
+TRAINER_VERSION = "combined_random70_15_15_logistic_ridge_v2"
+
+
+def log(message):
+    print(time.strftime("[%H:%M:%S]"), message, flush=True)
+
+
+def usable_rows(df):
+    return df[
+        (df["n_elig"] >= S["prediction_min_transactions"])
+        & df["w_ret"].notna()
+    ].copy()
+
+def combine_prepared_rows(prepared):
+    """
+    Convert the existing counter/ts prepared dataset into ONE row
+    per date. Timestamp features take priority when usable.
+
+    Also accepts an already-combined dataset.
+    """
+    data = prepared.copy()
+
+    if "input_method" not in data.columns:
+        data["input_method"] = data["mode"]
+
+    if not data["input_method"].isin(["ts", "counter"]).all():
+        raise ValueError("Expected ts/counter input methods")
+
+    missing = [
+        column
+        for column in FEATURES + ["date", "cls", "chg_pct"]
+        if column not in data.columns
+    ]
+    if missing:
+        raise ValueError(f"Prepared dataset lacks: {missing}")
+
+    usable = (
+        (data["n_elig"] >= S["prediction_min_transactions"])
+        & data["w_ret"].notna()
+    )
+
+    # Priority:
+    # 0 = usable timestamp window
+    # 1 = counter fallback
+    # 2 = unusable timestamp row, only if no counter exists
+    data["_priority"] = np.where(
+        (data["input_method"] == "ts") & usable,
+        0,
+        np.where(data["input_method"] == "counter", 1, 2),
+    )
+
+    data = (
+        data.sort_values(
+            ["date", "_priority"], kind="stable"
+        )
+        .drop_duplicates("date", keep="first")
+        .drop(columns="_priority")
+        .sort_values("date")
+        .reset_index(drop=True)
+    )
+
+    data["mode"] = "combined"
+
+    log(
+        f"COMBINED: {len(data)} dates; "
+        f"input methods={data['input_method'].value_counts().to_dict()}"
+    )
+
+    return data
+
+def fit_models(train):
+    if train["cls"].nunique() != 3:
+        raise ValueError(
+            "Training data must contain bear, deer and bull"
+        )
+
+    classifier_train = train
+
+    if S.get("isBalanced", False):
+        count = int(train["cls"].value_counts().min())
+        classifier_train = (
+            train.sort_values("date")
+            .groupby("cls", group_keys=False)
+            .tail(count)
+        )
+
+    classifier = make_pipeline(
+        SimpleImputer(strategy="median"),
+        StandardScaler(),
+        LogisticRegression(
+            C=1.0,
+            max_iter=2000,
+            random_state=42,
+        ),
+    )
+
+    regressor = make_pipeline(
+        SimpleImputer(strategy="median"),
+        StandardScaler(),
+        Ridge(alpha=1.0),
+    )
+
+    classifier.fit(
+        classifier_train[FEATURES],
+        classifier_train["cls"],
+    )
+
+    regressor.fit(
+        train[FEATURES],
+        train["chg_pct"],
+    )
+
+    return classifier, regressor
+
+def infer(models, data):
+    classifier, regressor = models
+
+    probabilities = classifier.predict_proba(
+        data[FEATURES]
+    )
+
+    order = list(classifier.classes_)
+    probabilities = probabilities[
+        :, [order.index(c) for c in CLASSES]
+    ]
+
+    predicted_class = np.array(CLASSES)[
+        probabilities.argmax(axis=1)
+    ]
+
+    predicted_pct = regressor.predict(
+        data[FEATURES]
+    )
+
+    return predicted_class, probabilities, predicted_pct
+
+def evaluate(models, data, majority):
+    predicted_class, probabilities, predicted_pct = infer(
+        models, data
+    )
+
+    predicted_points = (
+        predicted_pct * data["prev_close"].to_numpy()
+    )
+
+    metrics = {
+        "n_dates": len(data),
+        "earliest_date": data["date"].min(),
+        "latest_date": data["date"].max(),
+        "class_counts": data["cls"].value_counts().to_dict(),
+        "input_method_counts": (
+            data["input_method"].value_counts().to_dict()
+        ),
+        "accuracy": accuracy_score(
+            data["cls"], predicted_class
+        ),
+        "macro_f1": f1_score(
+            data["cls"],
+            predicted_class,
+            labels=CLASSES,
+            average="macro",
+            zero_division=0,
+        ),
+        "log_loss": log_loss(
+            data["cls"],
+            probabilities[:, [CLASSES.index(c) for c in sorted(CLASSES)]],
+            labels=sorted(CLASSES),
+        ),
+        "confusion_matrix": confusion_matrix(
+            data["cls"],
+            predicted_class,
+            labels=CLASSES,
+        ).tolist(),
+        "confusion_order": CLASSES,
+        "majority_baseline_accuracy": float(
+            (data["cls"] == majority).mean()
+        ),
+        "regression_mae_points": mean_absolute_error(
+            data["chg"], predicted_points
+        ),
+        "regression_rmse_points": float(
+            np.sqrt(
+                mean_squared_error(
+                    data["chg"], predicted_points
+                )
+            )
+        ),
+        "previous_close_baseline_mae_points": float(
+            data["chg"].abs().mean()
+        ),
+        "direction_hit": float(
+            (
+                np.sign(predicted_pct)
+                == np.sign(data["chg_pct"].to_numpy())
+            ).mean()
+        ),
+    }
+
+    predictions = data[
+        [
+            "date", "input_method", "cls",
+            "chg_pct", "prev_close", "close",
+        ]
+    ].copy()
+
+    predictions["predicted_class"] = predicted_class
+    predictions["predicted_change_pct"] = predicted_pct
+    predictions["predicted_close"] = (
+        data["prev_close"].to_numpy() * (1 + predicted_pct)
+    )
+
+    for i, cls in enumerate(CLASSES):
+        predictions[f"p_{cls}"] = probabilities[:, i]
+
+    return metrics, predictions
+
+def train_and_report(dataset, revisions):
+    dataset = combine_prepared_rows(dataset)
+
+    dataset.to_parquet(
+        OUT / "combined_dataset.parquet",
+        index=False,
+    )
+
+    data = usable_rows(dataset).sort_values("date")
+
+    # Keep the split based on all prepared dates, as before.
+    dates = np.array(sorted(dataset["date"].unique()))
+
+    if len(dates) < 30:
+        raise RuntimeError("At least 30 prepared dates required")
+
+    rng = np.random.default_rng(SPLIT_SEED)
+    shuffled = rng.permutation(dates).tolist()
+
+    a = int(len(shuffled) * 0.70)
+    b = int(len(shuffled) * 0.85)
+
+    groups = {
+        "train": sorted(shuffled[:a]),
+        "validation": sorted(shuffled[a:b]),
+        "test": sorted(shuffled[b:]),
+    }
+
+    pieces = {
+        name: data[data["date"].isin(selected)].copy()
+        for name, selected in groups.items()
+    }
+
+    counts = {
+        name: len(frame)
+        for name, frame in pieces.items()
+    }
+
+    if any(count == 0 for count in counts.values()):
+        raise RuntimeError(f"Empty usable split: {counts}")
+
+    log(
+        f"COMBINED RANDOM SPLIT | seed={SPLIT_SEED} | "
+        f"usable counts={counts}"
+    )
+
+    # Fit on training dates only to obtain held-out scores.
+    evaluation_models = fit_models(pieces["train"])
+    majority = pieces["train"]["cls"].mode().iloc[0]
+
+    report = {
+        "target": "same_day_close_vs_previous_close",
+        "input_selection": "usable_timestamp_window_else_counter",
+        "neutral_percentage": S["neutral_percentage"],
+        "source_revisions": revisions,
+        "settings": S.copy(),
+        "split_method": "random_by_date",
+        "split_seed": SPLIT_SEED,
+        "split_dates": groups,
+        "usable_split_counts": counts,
+        "classifier": "LogisticRegression(C=1.0)",
+        "regressor": "Ridge(alpha=1.0)",
+        "validation_used_for_tuning": False,
+        "log_loss_probability_order": sorted(CLASSES),
+    }
+
+    for split in ("validation", "test"):
+        metrics, predictions = evaluate(
+            evaluation_models,
+            pieces[split],
+            majority,
+        )
+
+        report[split] = metrics
+
+        predictions.to_csv(
+            OUT / f"combined_{split}_predictions.csv",
+            index=False,
+        )
+
+    log(
+        "COMBINED RANDOM TEST: "
+        + json.dumps(report["test"], default=str)
+    )
+
+    # Final fit on every usable day, saved in ONE file.
+    production_models = fit_models(data)
+
+    model_path = OUT / "combined_production.joblib"
+
+    joblib.dump(
+        {
+            "models": production_models,
+            "features": FEATURES,
+            "classes": CLASSES,
+            "settings": S.copy(),
+            "input_selection": "usable_timestamp_window_else_counter",
+            "trained_through": data["date"].max(),
+            "training_dates": data["date"].tolist(),
+            "n_training_dates": len(data),
+            "source_revisions": revisions,
+        },
+        model_path,
+    )
+
+    report["production"] = {
+        "file": model_path.name,
+        "n_training_dates": len(data),
+        "trained_through": data["date"].max(),
+    }
+
+    (OUT / "combined_report.json").write_text(
+        json.dumps(report, indent=2, default=str)
+    )
+
+    log(
+        f"SAVED: {model_path.name} | "
+        f"trained on all {len(data)} usable dates"
+    )
+
+    return report
+
+def train_and_publish(api, aggregate_revision=None):
+    """Evaluate on held-out dates; refit on ALL usable dates; upload ONE dated bundle."""
+    started = time.monotonic()
+    revision = aggregate_revision or api.repo_info(AGG_REPO, repo_type="dataset").sha
+    files = set(api.list_repo_files(AGG_REPO, repo_type="dataset", revision=revision))
+    if AGG_FILE not in files:
+        fail(f"Missing {AGG_REPO}/{AGG_FILE}")
+    cached = _hf_download(api, AGG_REPO, AGG_FILE, revision)
+    dataset = pd.read_parquet(cached)
+    if dataset.empty:
+        fail("Aggregate dataset is empty")
+    # Validate the exact non-broker schema, dates and labels without altering rows.
+    merge_aggregate(dataset, dataset.iloc[0].to_dict())
+    for field in FEATURES + ['prev_close','close','chg','chg_pct']:
+        dataset[field] = pd.to_numeric(dataset[field], errors='raise')
+    if np.isinf(dataset[FEATURES].to_numpy(dtype=float)).any():
+        fail('Infinite aggregate feature values; repair the aggregate before training')
+    target_values = dataset[['prev_close','close','chg','chg_pct']].to_numpy(dtype=float)
+    if not np.isfinite(target_values).all() or not (dataset[['prev_close','close']] > 0).all().all():
+        fail('Missing/invalid index targets in aggregate')
+    if not np.allclose(dataset['close'] - dataset['prev_close'], dataset['chg'], rtol=1e-9, atol=1e-9):
+        fail('Aggregate change points do not match index closes')
+    if not np.allclose(dataset['chg'] / dataset['prev_close'], dataset['chg_pct'], rtol=1e-9, atol=1e-9):
+        fail('Aggregate change fractions do not match index closes')
+    if dataset.date.max() > datetime.now(NEPAL).strftime('%Y-%m-%d'):
+        fail('Aggregate contains future trading dates')
+    sources = {'aggregate_repo':AGG_REPO, 'aggregate_revision':revision,
+               'aggregate_file':AGG_FILE, 'aggregate_sha256':hashlib.sha256(cached.read_bytes()).hexdigest()}
+    if AGG_META in files:
+        meta = json.loads(_hf_download(api, AGG_REPO, AGG_META, revision).read_text())
+        if meta.get('aggregation') != {'version':AGG_VERSION,'settings':S}:
+            fail('Aggregate metadata/settings do not match this trainer')
+        sources['daily_sources'] = meta.get('daily_sources', {})
+    else:
+        log('Training existing seed: original non-broker aggregation settings assumed; schema and targets validated.')
+    # Read before fitting; reject a concurrent model-repo change rather than silently overwrite it.
+    model_revision = api.repo_info(MODEL_REPO, repo_type='model').sha
+    OUT.mkdir(parents=True, exist_ok=True)
+    report = train_and_report(dataset, sources)
+    bundle_path = OUT / 'combined_production.joblib'
+    bundle = joblib.load(bundle_path)  # This file was just written by this process.
+    trained_through = str(bundle['trained_through'])
+    model_name = f'combined_production_{trained_through}.joblib'
+    report_name = f'combined_report_{trained_through}.json'
+    versions = {'python':platform.python_version(), 'scikit_learn':sklearn.__version__,
+                'numpy':np.__version__, 'pandas':pd.__version__, 'joblib':joblib.__version__}
+    bundle['library_versions'] = versions
+    bundle['trainer_version'] = TRAINER_VERSION
+    bundle['created_at'] = datetime.now(UTC).isoformat()
+    bundle['training_start_date'] = min(bundle['training_dates'])
+    dated_path = OUT / model_name
+    joblib.dump(bundle, dated_path)
+    report['production']['file'] = model_name
+    report['production']['repo'] = MODEL_REPO
+    report['library_versions'] = versions
+    report['trainer_version'] = TRAINER_VERSION
+    report['created_at'] = bundle['created_at']
+    report['evaluation_note'] = ('Random-date held-out results belong to the evaluation fit. '
+        'The published model is refitted on every usable date, including held-out dates; '
+        'those scores are not an independent evaluation of the refitted model.')
+    report_path = OUT / report_name
+    report_path.write_text(json.dumps(report, indent=2, default=str))
+    operations = [CommitOperationAdd(path_in_repo=model_name, path_or_fileobj=str(dated_path)),
+                  CommitOperationAdd(path_in_repo=report_name, path_or_fileobj=str(report_path))]
+    for split in ('validation','test'):
+        operations.append(CommitOperationAdd(
+            path_in_repo=f'combined_{split}_predictions_{trained_through}.csv',
+            path_or_fileobj=str(OUT / f'combined_{split}_predictions.csv')))
+    commit = api.create_commit(repo_id=MODEL_REPO, repo_type='model', parent_commit=model_revision,
+        commit_message=f'Train combined NEPSE model through {trained_through}', operations=operations)
+    url = str(getattr(commit,'commit_url',''))
+    log(f'[MODEL UPLOAD SUCCESS] {MODEL_REPO}/{model_name}; '
+        f'{bundle["n_training_dates"]} training dates; {time.monotonic()-started:.1f}s; {url}')
+    return {'status':'UPLOADED','repo':MODEL_REPO,'file':model_name,
+            'trained_through':trained_through, 'n_training_dates':bundle['n_training_dates'], 'commit_url':url}
 
 
 def main(argv=None):
@@ -778,7 +1213,20 @@ def main(argv=None):
     parser.add_argument("--replace-existing", action="store_true", help="Explicitly overwrite an existing daily HF file")
     parser.add_argument("--yes", action="store_true", help="Upload without confirmation (use only for deliberate automation)")
     parser.add_argument("--aggregate-only", action="store_true", help="Rebuild one aggregate row from already-published daily floorsheets; no API fetch")
+    parser.add_argument("--train-only", action="store_true", help="Train/publish from HF aggregate; skip raw fetch and aggregation")
     args = parser.parse_args(argv)
+    if args.train_only:
+        if args.aggregate_only or args.replace_existing or args.expected_count is not None:
+            parser.error("--train-only cannot be combined with raw/aggregation options")
+        auto_confirm = args.yes or os.getenv("GITHUB_ACTIONS", "").lower() == "true"
+        if not auto_confirm and input(f"Train from {AGG_REPO} and publish to {MODEL_REPO}? [y/N]: ").strip().lower() != "y":
+            return 0
+        try:
+            train_and_publish(HfApi(token=os.getenv("HF_TOKEN") or None))
+            return 0
+        except Exception as exc:
+            print(f"[TRAIN/PUBLISH FAILED] {type(exc).__name__}: {exc}", file=sys.stderr)
+            return 1
     target_day = date.fromisoformat(args.date)
     now_nepal = datetime.now(NEPAL)
     if target_day > now_nepal.date():
@@ -808,12 +1256,15 @@ def main(argv=None):
                 fail(f"{repo}/{remote} does not exist; run without --aggregate-only first")
             print(f"[raw retained] {repo}/{remote}; continuing to aggregate")
             report["status"] = "RAW_EXISTS_AGGREGATE_PENDING"
-            if not auto_confirm and input(f"Update {AGG_REPO}/{AGG_FILE}? [y/N]: ").strip().lower() != "y":
+            if not auto_confirm and input(f"Update {AGG_REPO}/{AGG_FILE}, train and publish to {MODEL_REPO}? [y/N]: ").strip().lower() != "y":
                 report["status"] = "USER_DECLINED_AGGREGATE"
                 save_report(args.date, report)
                 return 0
             report["aggregate"] = publish_aggregate(api, repo, args.date)
-            report["status"] = "RAW_EXISTS_AGGREGATE_SUCCESS"
+            report["status"] = "AGGREGATE_SUCCESS_MODEL_PENDING"
+            save_report(args.date, report)
+            report["model"] = train_and_publish(api, report["aggregate"].get("revision"))
+            report["status"] = "RAW_EXISTS_AGGREGATE_AND_MODEL_SUCCESS"
             save_report(args.date, report)
             return 0
         path, report = collect_day(args.date, args.expected_count)
@@ -828,7 +1279,7 @@ def main(argv=None):
         if auto_confirm:
             print("[upload] Automatic confirmation: GitHub Actions or --yes")
         else:
-            prompt = f"Upload {remote} to {repo} and update {AGG_REPO}/{AGG_FILE}? [y/N]: "
+            prompt = f"Upload {remote}, update {AGG_REPO}/{AGG_FILE}, train and publish to {MODEL_REPO}? [y/N]: "
             if input(prompt).strip().lower() != "y":
                 print("[no upload] Local validated Parquet kept.")
                 report["status"] = "USER_DECLINED_UPLOAD"
@@ -847,7 +1298,10 @@ def main(argv=None):
         report["status"] = "RAW_UPLOADED_AGGREGATE_PENDING"
         save_report(args.date, report)
         report["aggregate"] = publish_aggregate(api, repo, args.date)
-        report["status"] = "RAW_AND_AGGREGATE_SUCCESS"
+        report["status"] = "RAW_AND_AGGREGATE_SUCCESS_MODEL_PENDING"
+        save_report(args.date, report)
+        report["model"] = train_and_publish(api, report["aggregate"].get("revision"))
+        report["status"] = "RAW_AGGREGATE_AND_MODEL_SUCCESS"
         save_report(args.date, report)
         return 0
     except Exception as exc:
@@ -857,7 +1311,7 @@ def main(argv=None):
         report["error"] = f"{type(exc).__name__}: {exc}"
         save_report(args.date, report)
         print("[FAILED]", report["error"], file=sys.stderr)
-        print("Raw and aggregate uploads are separate commits. Raw data may already be saved; rerun the same --date to finish aggregation.", file=sys.stderr)
+        print("Raw, aggregate and model uploads are separate commits. Earlier steps may already be saved; rerun the same --date, or --train-only if only training/publishing failed.", file=sys.stderr)
         return 1
 
 
