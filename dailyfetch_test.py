@@ -405,7 +405,7 @@ import pandas as pd
 from huggingface_hub import hf_hub_download, CommitOperationAdd
 from huggingface_hub.utils import HfHubHTTPError
 
-AGG_REPO = os.getenv("HF_AGG_REPO_ID", "ranjansummit/testing")
+AGG_REPO = os.getenv("HF_AGG_REPO_ID", "ranjansummit/aggregatedindices")
 AGG_FILE = "combined_dataset.parquet"
 AGG_META = "combined_dataset.metadata.json"
 INDEX_REPO = os.getenv("HF_INDEX_REPO_ID", "ranjansummit/dailyindices")
