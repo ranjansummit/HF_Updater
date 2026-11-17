@@ -46,4 +46,4 @@ jobs:
             joblib
 
       - name: Fetch, aggregate, train and publish
-        run: python daily_fetch_test.py --yes
+        run: python dailyfetch_test.py --yes
