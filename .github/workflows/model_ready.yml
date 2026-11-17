@@ -47,4 +47,3 @@ jobs:
 
       - name: Fetch, aggregate, train and publish
         run: python daily_fetch_test.py --yes
-_
