@@ -19,7 +19,7 @@ jobs:
 
     env:
       HF_TOKEN: ${{ secrets.HF_TOKEN }}
-      HF_REPO_ID: ranjansummit/nepse_floorsheet
+      HF_REPO_ID: ranjansummit/dailyindices
       HF_INDEX_REPO_ID: ranjansummit/dailyindices
       HF_AGG_REPO_ID: ranjansummit/testing
       HF_MODEL_REPO_ID: ranjansummit/nepse-p33-models
@@ -46,4 +46,5 @@ jobs:
             joblib
 
       - name: Fetch, aggregate, train and publish
-        run: python daily_fetch.py --yes
+        run: python daily_fetch_test.py --yes
+_
