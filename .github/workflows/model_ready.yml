@@ -1,4 +1,4 @@
-name: Daily NEPSE Fetch, Aggregate and Train
+name: testing fetch aggregating
 
 on:
   schedule:
