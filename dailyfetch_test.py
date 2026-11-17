@@ -2,7 +2,7 @@
 
 Raw: ranjansummit/nepse_floorsheet/YYYY-MM-DD.parquet
 Aggregated: ranjansummit/testing/combined_dataset.parquet (upsert one date)
-Index: ranjansummit/dailyindices/NEPSE_INDEX.csv (must include the target close)
+Index: official NEPSE API -> ranjansummit/dailyindices/NEPSE_INDEX.csv
 
 Usage: python nepse_daily_v2.py --yes
 Repair an aggregate: python nepse_daily_v2.py --date YYYY-MM-DD --aggregate-only --yes
@@ -12,7 +12,8 @@ Uses the original non-broker feature formulas; S below must match seed training 
 Model: ranjansummit/nepse-p33-models/combined_production_YYYY-MM-DD.joblib
 Filename date is the last usable training date, not the execution date.
 Train only: python nepse_daily_v2.py --train-only --yes
-Also requires scikit-learn==1.6.1 joblib; optional HF_MODEL_REPO_ID.
+Also requires scikit-learn==1.6.1 joblib wasmtime; optional HF_MODEL_REPO_ID.
+Official index authentication downloads css.wasm from the official NEPSE site.
 No broker features, historical master download, or historical backfill.
 """
 from __future__ import annotations
@@ -630,6 +631,232 @@ def _read_complete_daily(path, day):
         frame[col] = frame[col].fillna('<missing>').astype(str)
     frame['traded_at'] = parse_times(frame)
     return frame.sort_values('contract_id').reset_index(drop=True)
+
+
+# Official website client: same WASM-token approach as the earlier client.py.
+# No third-party price/index fallback. The public website session needs no account key.
+class OfficialNepseIndex:
+    def __init__(self, origin):
+        import wasmtime
+        from requests.adapters import HTTPAdapter
+        from urllib3.util.retry import Retry
+        self.origin = origin.rstrip('/')
+        self.session = requests.Session()
+        retry = Retry(total=2, backoff_factor=0.5,
+                      status_forcelist=[429,500,502,503,504], allowed_methods=['GET'])
+        self.session.mount('https://', HTTPAdapter(max_retries=retry))
+        self.session.headers.update({'User-Agent':'Mozilla/5.0',
+                                     'Referer':self.origin+'/', 'Accept':'application/json'})
+        try:
+            response = self.session.get(self.origin+'/assets/prod/css.wasm', timeout=(10,20))
+            response.raise_for_status()
+            if not response.content.startswith(b'\x00asm'):
+                fail('Official css.wasm URL did not return a WebAssembly module')
+            engine = wasmtime.Engine()
+            self.store = wasmtime.Store(engine)
+            module = wasmtime.Module(engine, response.content)
+            self.exports = wasmtime.Instance(self.store, module, []).exports(self.store)
+            self.authenticate()
+        except Exception:
+            self.session.close()
+            raise
+
+    def authenticate(self):
+        self.session.headers.pop('Authorization', None)
+        response = self.session.get(self.origin+'/api/authenticate/prove', timeout=(10,20))
+        response.raise_for_status()
+        proof = response.json()
+        s1,s2,s3,s4,s5 = (int(proof[f'salt{i}']) for i in range(1,6))
+        token = proof['accessToken']
+        salt_orders = [('cdx',(s1,s2,s3,s4,s5)), ('rdx',(s1,s2,s4,s3,s5)),
+                       ('bdx',(s1,s2,s4,s3,s5)), ('ndx',(s1,s2,s4,s3,s5)),
+                       ('mdx',(s1,s2,s4,s3,s5))]
+        cuts = [int(self.exports[name](self.store,*salts)) for name,salts in salt_orders]
+        if len(set(cuts)) != 5 or any(i < 0 or i >= len(token) for i in cuts):
+            fail('Official token format changed: invalid WASM character positions')
+        cutset = set(cuts)
+        clean = ''.join(c for i,c in enumerate(token) if i not in cutset)
+        self.session.headers['Authorization'] = 'Salter ' + clean
+
+    def history_page(self, page):
+        url = self.origin+'/api/nots/index/history/58'
+        params = {'size':500, 'page':page, 'sort':'businessDate,desc'}
+        response = self.session.get(url, params=params, timeout=(10,30))
+        if response.status_code == 401:
+            self.authenticate()
+            response = self.session.get(url, params=params, timeout=(10,30))
+        response.raise_for_status()
+        payload = response.json()
+        if not isinstance(payload,dict) or not isinstance(payload.get('content'),list):
+            fail('Unexpected official index-history response; expected content list')
+        return payload
+
+    def close(self):
+        self.session.close()
+
+
+def _official_day(value):
+    # Business dates are explicit dates in the official API, never inferred from IDs.
+    result = str(value or '')[:10]
+    try:
+        return date.fromisoformat(result).isoformat()
+    except ValueError:
+        fail(f'Invalid official index businessDate: {result!r}')
+
+
+def fetch_official_index_rows(target_day, since):
+    errors = []
+    for origin in ('https://www.nepalstock.com','https://nepalstock.com.np'):
+        client = None
+        try:
+            print(f'[INDEX FETCH] Official NEPSE index 58: {origin}; through {target_day}', flush=True)
+            client = OfficialNepseIndex(origin)
+            records, seen_pages = [], set()
+            found_target = False
+            for page in range(100):
+                payload = client.history_page(page)
+                content = payload['content']
+                if not content:
+                    break
+                dates = [_official_day(item.get('businessDate')) for item in content]
+                signature = tuple(dates)
+                if signature in seen_pages:
+                    fail('Official index API repeated a page; refusing incomplete history')
+                seen_pages.add(signature)
+                records.extend(content)
+                found_target = found_target or target_day in dates
+                print(f'[INDEX PAGE] {page}: {len(content)} rows; {min(dates)} .. {max(dates)}', flush=True)
+                if payload.get('last') or (found_target and min(dates) <= since):
+                    break
+            else:
+                fail('Official index history exceeded pagination limit')
+            rows = [row for row in records if since <= _official_day(row.get('businessDate')) <= target_day]
+            if not any(_official_day(row.get('businessDate')) == target_day for row in rows):
+                fail(f'Official NEPSE history has no completed index row for {target_day} yet')
+            return rows, origin+'/api/nots/index/history/58'
+        except Exception as exc:
+            # Never print response bodies, request headers or API tokens.
+            errors.append(f'{origin}: {type(exc).__name__}: {str(exc)[:200]}')
+            print(f'[INDEX SOURCE FAILED] {errors[-1]}', flush=True)
+        finally:
+            if client is not None:
+                client.close()
+    fail('Official NEPSE index update failed. No third-party index substituted. '+ ' | '.join(errors))
+
+
+def _official_number(record, aliases):
+    for name in aliases:
+        if record.get(name) is not None and str(record[name]).strip() != '':
+            value = float(str(record[name]).replace(',',''))
+            if not math.isfinite(value):
+                fail(f'Nonfinite official index field: {name}')
+            return value
+    return None
+
+
+def merge_official_index(existing, records, target_day):
+    """Preserve history/schema; update supplied official values; leave absent fields blank."""
+    result = existing.copy()
+    result.columns = result.columns.str.strip().str.lower()
+    date_col = 'published_date' if 'published_date' in result.columns else 'date'
+    if date_col not in result.columns or 'close' not in result.columns:
+        fail('NEPSE_INDEX.csv requires published_date/date and close')
+    result[date_col] = pd.to_datetime(result[date_col], errors='raise', format='mixed').dt.strftime('%Y-%m-%d')
+    if result[date_col].isna().any() or result[date_col].duplicated().any():
+        fail('Existing index CSV has missing/duplicate dates')
+    prior_closes = pd.to_numeric(result['close'], errors='raise')
+    if not np.isfinite(prior_closes).all() or not (prior_closes > 0).all():
+        fail('Existing index CSV contains invalid closes')
+    frame = result.set_index(date_col)
+    fields = {
+        'open':('openingIndex','openIndex','open'),
+        'high':('highIndex','high'), 'low':('lowIndex','low'),
+        'close':('closingIndex',),
+        'per_change':('percentageChange','percentChange','perChange'),
+        'traded_quantity':('totalTradedQuantity','totalQuantity','tradedQuantity'),
+        'traded_amount':('totalTurnover','totalTradedValue','tradedAmount','turnover'),
+    }
+    incoming = {}
+    for record in records:
+        day = _official_day(record.get('businessDate'))
+        if day > target_day:
+            continue
+        close = _official_number(record, ('closingIndex',))
+        if close is None or close <= 0:
+            fail(f'{day}: missing/invalid closingIndex from official NEPSE history')
+        if day in incoming and incoming[day]['closingIndex'] != record['closingIndex']:
+            fail(f'{day}: conflicting official index closes')
+        incoming[day] = record
+    if target_day not in incoming:
+        fail(f'Official response lacks requested index date {target_day}')
+    for day,record in sorted(incoming.items()):
+        if day not in frame.index:
+            frame.loc[day] = {col:np.nan for col in frame.columns}
+        for col,aliases in fields.items():
+            if col not in frame.columns:
+                continue
+            value = _official_number(record,aliases)
+            if value is not None:
+                frame.loc[day,col] = value
+        # totalTransaction is a trade COUNT, never a share quantity or turnover.
+        # Keep source status only if present; do not invent an 'A' status.
+        if 'status' in frame.columns and record.get('status') is not None:
+            frame.loc[day,'status'] = str(record['status'])
+    frame = frame.sort_index()
+    if 'per_change' in frame.columns:
+        returns = pd.to_numeric(frame['close']).pct_change(fill_method=None)*100
+        for day in incoming:
+            # Missing percent change can be derived from adjacent official closes.
+            if pd.isna(frame.loc[day,'per_change']) and pd.notna(returns.loc[day]):
+                frame.loc[day,'per_change'] = float(returns.loc[day])
+    return frame.reset_index()[result.columns]
+
+
+def refresh_official_index(api, target_day):
+    revision = api.repo_info(INDEX_REPO, repo_type='dataset').sha
+    seed = pd.read_csv(_hf_download(api, INDEX_REPO, INDEX_FILE, revision))
+    date_col = 'published_date' if 'published_date' in seed else 'date'
+    if date_col not in seed:
+        fail('Index CSV has no date column')
+    known_dates = pd.to_datetime(seed[date_col],errors='raise',format='mixed').dt.strftime('%Y-%m-%d')
+    relevant = known_dates[known_dates <= target_day]
+    since = min(target_day, str(relevant.max())) if not relevant.empty else target_day
+    # Includes last saved session plus all subsequent official rows through target.
+    records,source_url = fetch_official_index_rows(target_day,since)
+    for attempt in range(3):
+        if attempt:
+            revision = api.repo_info(INDEX_REPO, repo_type='dataset').sha
+            seed = pd.read_csv(_hf_download(api, INDEX_REPO, INDEX_FILE, revision))
+        merged = merge_official_index(seed,records,target_day)
+        # Identical values need no redundant commit.
+        try:
+            pd.testing.assert_frame_equal(seed.reset_index(drop=True),merged.reset_index(drop=True),
+                                          check_dtype=False,check_exact=True)
+            print(f'[INDEX SUCCESS] {target_day}: official values already match HF; no commit', flush=True)
+            return {'status':'UNCHANGED','date':target_day,'source':source_url,'revision':revision}
+        except AssertionError:
+            pass
+        OUT_DIR.mkdir(parents=True,exist_ok=True)
+        output = OUT_DIR/INDEX_FILE
+        merged.to_csv(output,index=False)
+        audit = {'source':source_url,'index_id':58,'requested_date':target_day,
+                 'fetched_at':datetime.now(UTC).isoformat(), 'official_records':records}
+        try:
+            commit = api.create_commit(repo_id=INDEX_REPO,repo_type='dataset',parent_commit=revision,
+                commit_message=f'Update official NEPSE index through {target_day}',operations=[
+                    CommitOperationAdd(path_in_repo=INDEX_FILE,path_or_fileobj=str(output)),
+                    CommitOperationAdd(path_in_repo=f'index_audit/{target_day}.json',
+                                       path_or_fileobj=json.dumps(audit,indent=2).encode()),
+                ])
+        except HfHubHTTPError as exc:
+            if getattr(exc.response,'status_code',None) in (409,412) and attempt < 2:
+                continue
+            raise
+        url = str(getattr(commit,'commit_url',''))
+        print(f'[INDEX UPLOAD SUCCESS] {INDEX_REPO}/{INDEX_FILE}: {target_day}; {url}',flush=True)
+        return {'status':'UPLOADED','date':target_day,'source':source_url,'commit_url':url,
+                'revision':getattr(commit,'oid',None)}
+    fail('Could not commit the official index update')
 
 
 def _read_index_file(path):
@@ -1256,10 +1483,12 @@ def main(argv=None):
                 fail(f"{repo}/{remote} does not exist; run without --aggregate-only first")
             print(f"[raw retained] {repo}/{remote}; continuing to aggregate")
             report["status"] = "RAW_EXISTS_AGGREGATE_PENDING"
-            if not auto_confirm and input(f"Update {AGG_REPO}/{AGG_FILE}, train and publish to {MODEL_REPO}? [y/N]: ").strip().lower() != "y":
+            if not auto_confirm and input(f"Refresh official index in {INDEX_REPO}, update {AGG_REPO}/{AGG_FILE}, train and publish to {MODEL_REPO}? [y/N]: ").strip().lower() != "y":
                 report["status"] = "USER_DECLINED_AGGREGATE"
                 save_report(args.date, report)
                 return 0
+            report["index"] = refresh_official_index(api, args.date)
+            save_report(args.date, report)
             report["aggregate"] = publish_aggregate(api, repo, args.date)
             report["status"] = "AGGREGATE_SUCCESS_MODEL_PENDING"
             save_report(args.date, report)
@@ -1279,7 +1508,7 @@ def main(argv=None):
         if auto_confirm:
             print("[upload] Automatic confirmation: GitHub Actions or --yes")
         else:
-            prompt = f"Upload {remote}, update {AGG_REPO}/{AGG_FILE}, train and publish to {MODEL_REPO}? [y/N]: "
+            prompt = f"Upload {remote}, refresh official index in {INDEX_REPO}, update {AGG_REPO}/{AGG_FILE}, train and publish to {MODEL_REPO}? [y/N]: "
             if input(prompt).strip().lower() != "y":
                 print("[no upload] Local validated Parquet kept.")
                 report["status"] = "USER_DECLINED_UPLOAD"
@@ -1296,6 +1525,8 @@ def main(argv=None):
         save_report(args.date, report)
         print("[UPLOAD SUCCESS]", report["commit_url"])
         report["status"] = "RAW_UPLOADED_AGGREGATE_PENDING"
+        save_report(args.date, report)
+        report["index"] = refresh_official_index(api, args.date)
         save_report(args.date, report)
         report["aggregate"] = publish_aggregate(api, repo, args.date)
         report["status"] = "RAW_AND_AGGREGATE_SUCCESS_MODEL_PENDING"
