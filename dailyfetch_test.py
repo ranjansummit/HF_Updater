@@ -25,7 +25,7 @@ import os
 import re
 import sys
 import time
-from datetime import date, datetime, time as dtime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 import pyarrow as pa
@@ -1432,9 +1432,26 @@ def train_and_publish(api, aggregate_revision=None):
             'trained_through':trained_through, 'n_training_dates':bundle['n_training_dates'], 'commit_url':url}
 
 
+def latest_floorsheet_date(now_nepal):
+    candidate = now_nepal.date()
+    with requests.Session() as session:
+        session.headers.update({"User-Agent": "NEPSE-daily-parquet-v2/1.0", "Accept": "application/json"})
+        for _ in range(31):
+            day = candidate.isoformat()
+            page = fetch_page(session, day, 1)
+            if page is not None:
+                rows, total = page
+                if rows:
+                    return day
+                if total:
+                    fail(f"{day}: source reported transactions but returned an empty first page")
+            candidate -= timedelta(days=1)
+    fail("No available floorsheet in the last 31 eligible calendar days")
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--date", default=datetime.now(NEPAL).strftime("%Y-%m-%d"), help="Nepal trading date YYYY-MM-DD; default today")
+    parser.add_argument("--date", default=None, help="Nepal trading date YYYY-MM-DD; default latest available floorsheet")
     parser.add_argument("--expected-count", type=int, help="Known official unique-transaction count, if available")
     parser.add_argument("--allow-historical", action="store_true", help="Explicitly allow dates overlapping V2 master")
     parser.add_argument("--replace-existing", action="store_true", help="Explicitly overwrite an existing daily HF file")
@@ -1454,12 +1471,13 @@ def main(argv=None):
         except Exception as exc:
             print(f"[TRAIN/PUBLISH FAILED] {type(exc).__name__}: {exc}", file=sys.stderr)
             return 1
-    target_day = date.fromisoformat(args.date)
     now_nepal = datetime.now(NEPAL)
+    if args.date is None:
+        args.date = latest_floorsheet_date(now_nepal)
+        print(f"[AUTO DATE] Nepal time {now_nepal:%Y-%m-%d %H:%M}; selected {args.date}", flush=True)
+    target_day = date.fromisoformat(args.date)
     if target_day > now_nepal.date():
         fail("Cannot fetch a future date")
-    if target_day == now_nepal.date() and now_nepal.time() < dtime(16, 0):
-        fail("Today is still within the post-market buffer (before 16:00 Nepal time). Run after 16:00.")
     if target_day <= MASTER_LAST_DATE and not args.allow_historical and not args.aggregate_only:
         fail(f"{args.date} may already exist in V2 master (through {MASTER_LAST_DATE}). "
              "Refusing duplicate historical publication; use --allow-historical only if intentional.")
