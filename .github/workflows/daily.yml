@@ -2,7 +2,7 @@ name: Daily NEPSE Fetch, Aggregate and Train
 
 on:
   schedule:
-    - cron: '15 10 * * *' # 10:15 UTC = 16:00 Nepal time
+        - cron: '15 10 * * 1-5'  # Monday–Friday, 4:00 PM Nepal
   workflow_dispatch:
 
 permissions:
