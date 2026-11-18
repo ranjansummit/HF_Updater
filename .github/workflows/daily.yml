@@ -19,9 +19,9 @@ jobs:
 
     env:
       HF_TOKEN: ${{ secrets.HF_TOKEN }}
-      HF_REPO_ID: ranjansummit/dailyindices
+      HF_REPO_ID: ranjansummit/nepse_floorsheet
       HF_INDEX_REPO_ID: ranjansummit/dailyindices
-      HF_AGG_REPO_ID: ranjansummit/testing
+      HF_AGG_REPO_ID: ranjansummit/aggregatedindices
       HF_MODEL_REPO_ID: ranjansummit/nepse-p33-models
       PYTHONUNBUFFERED: "1"
 
