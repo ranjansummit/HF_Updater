@@ -38,4 +38,4 @@ shell: bash
 run: |
 args=()
 if [[ -n "$WEEK_OF" ]]; then args+=(--week-of "$WEEK_OF"); fi
-python weekly_filler.py "${args[@]}"
+python weeklyfiller.py "${args[@]}"
